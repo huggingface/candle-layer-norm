@@ -39,7 +39,7 @@ fn main() -> Result<()> {
     for kernel_file in KERNEL_FILES.iter() {
         println!("cargo:rerun-if-changed=kernels/{kernel_file}");
     }
-    println!("cargo:rerun-if-changed=kernels/ln.h");
+    println!("cargo:rerun-if-changed=kernels/**.cu");
     println!("cargo:rerun-if-changed=kernels/ln_fwd_kernels.cuh");
     println!("cargo:rerun-if-changed=kernels/ln_kernel_traits.h");
     println!("cargo:rerun-if-changed=kernels/ln_utils.cuh");
@@ -78,12 +78,25 @@ fn main() -> Result<()> {
             (kernel_dir.join(f), obj_file)
         })
         .collect();
+
+    let out_modified: Result<_, _> = out_file.metadata().and_then(|m| m.modified());
     let should_compile = if out_file.exists() {
-        cu_files.iter().any(|(cu_file, _)| {
-            let out_modified = out_file.metadata().unwrap().modified().unwrap();
-            let in_modified = cu_file.metadata().unwrap().modified().unwrap();
-            in_modified.duration_since(out_modified).is_ok()
-        })
+        kernel_dir
+            .read_dir()
+            .expect("kernels folder should exist")
+            .into_iter()
+            .any(|entry| {
+                if let (Ok(entry), Ok(out_modified)) = (entry, &out_modified) {
+                    let in_modified = entry.metadata().unwrap().modified().unwrap();
+                    println!(
+                        "cargo:warning= {:?} {in_modified:?} - {out_modified:?} - {entry:?}",
+                        in_modified.duration_since(*out_modified)
+                    );
+                    in_modified.duration_since(*out_modified).is_ok()
+                } else {
+                    true
+                }
+            })
     } else {
         true
     };
