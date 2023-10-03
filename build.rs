@@ -6,9 +6,7 @@ use rayon::prelude::*;
 use std::path::PathBuf;
 use std::str::FromStr;
 
-const KERNEL_FILES: [&str; 1] = [
-    "ln_api.cu"
-];
+const KERNEL_FILES: [&str; 1] = ["ln_api.cu"];
 
 fn main() -> Result<()> {
     let num_cpus = std::env::var("RAYON_NUM_THREADS").map_or_else(

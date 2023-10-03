@@ -1,19 +1,19 @@
 mod ffi;
 
-use std::ptr;
 use candle::backend::BackendStorage;
+use candle::cuda_backend::cudarc::driver::sys::CUdevice_attribute::CU_DEVICE_ATTRIBUTE_MULTIPROCESSOR_COUNT;
 use candle::cuda_backend::cudarc::driver::DevicePtr;
 use candle::cuda_backend::WrapErr;
-use candle::{CpuStorage, DType, Layout, Result, Shape, Tensor, Storage};
-use candle::cuda_backend::cudarc::driver::sys::CUdevice_attribute::CU_DEVICE_ATTRIBUTE_MULTIPROCESSOR_COUNT;
+use candle::{CpuStorage, DType, Layout, Result, Shape, Storage, Tensor};
 use half::{bf16, f16};
+use std::ptr;
 
 fn layer_norm_internal_type(dtype: DType) -> Result<u32> {
     let internal_type = match dtype {
         DType::F16 => 0,
         DType::BF16 => 1,
         DType::F32 => 2,
-        dtype => candle::bail!("dtype {dtype:?} is not supported")
+        dtype => candle::bail!("dtype {dtype:?} is not supported"),
     };
     Ok(internal_type)
 }
@@ -31,7 +31,7 @@ fn round_multiple(x: usize, m: usize) -> usize {
 
 impl LayerNorm {
     fn fwd<
-        T: candle::cuda_backend::CudaDType + candle::cuda_backend::cudarc::driver::DeviceRepr
+        T: candle::cuda_backend::CudaDType + candle::cuda_backend::cudarc::driver::DeviceRepr,
     >(
         &self,
         x: &candle::CudaStorage,
@@ -51,14 +51,14 @@ impl LayerNorm {
         let (g, g_l) = self.gamma.storage_and_layout();
         let g = match &*g {
             Storage::Cpu(_) => candle::bail!("gamma must be a cuda tensor"),
-            Storage::Cuda(g) => g
+            Storage::Cuda(g) => g,
         };
 
         // Make sure that beta is a CUDA tensor and get the underlying storage
         let (b, b_l) = self.beta.storage_and_layout();
         let b = match &*b {
             Storage::Cpu(_) => candle::bail!("gamma must be a cuda tensor"),
-            Storage::Cuda(b) => b
+            Storage::Cuda(b) => b,
         };
 
         // Get cuda slices for all tensors
@@ -88,9 +88,7 @@ impl LayerNorm {
         let b_rank = b_stride.len();
 
         if x_rank != 2 {
-            candle::bail!(
-                "layer-norm expects input tensors of rank 2. Found: {x_rank}"
-            )
+            candle::bail!("layer-norm expects input tensors of rank 2. Found: {x_rank}")
         }
         if x_stride[x_rank - 1] != 1 {
             candle::bail!("the last dim of x must be contiguous {x_stride:?}")
@@ -137,9 +135,7 @@ impl LayerNorm {
             let r_rank = r_stride.len();
 
             if r_rank != 2 {
-                candle::bail!(
-                "layer-norm expects input tensors of rank 2. Found: {r_rank}"
-            )
+                candle::bail!("layer-norm expects input tensors of rank 2. Found: {r_rank}")
             }
 
             if r_stride[r_rank - 1] != 1 {
@@ -150,7 +146,6 @@ impl LayerNorm {
             ptr::null() as *const std::ffi::c_void
         };
 
-
         // Get cuda device pointers from cuda slices
         let x_ptr = *x.device_ptr() as *const core::ffi::c_void;
         let g_ptr = *g.device_ptr() as *const core::ffi::c_void;
@@ -160,7 +155,9 @@ impl LayerNorm {
         let mu_ptr = *mu.device_ptr() as *const core::ffi::c_void;
         let rsigma_ptr = *rsigma.device_ptr() as *const core::ffi::c_void;
 
-        let multi_processors_count = dev.attribute(CU_DEVICE_ATTRIBUTE_MULTIPROCESSOR_COUNT).unwrap();
+        let multi_processors_count = dev
+            .attribute(CU_DEVICE_ATTRIBUTE_MULTIPROCESSOR_COUNT)
+            .unwrap();
 
         unsafe {
             // Launch Kernel
@@ -198,11 +195,7 @@ impl candle::CustomOp1 for LayerNorm {
         "fused-layer-norm"
     }
 
-    fn cpu_fwd(
-        &self,
-        _: &CpuStorage,
-        _: &Layout,
-    ) -> Result<(CpuStorage, Shape)> {
+    fn cpu_fwd(&self, _: &CpuStorage, _: &Layout) -> Result<(CpuStorage, Shape)> {
         candle::bail!("no cpu support for fused-layer-norm")
     }
 
@@ -215,7 +208,9 @@ impl candle::CustomOp1 for LayerNorm {
             DType::F16 => self.fwd::<f16>(x, x_l, None, None),
             DType::BF16 => self.fwd::<bf16>(x, x_l, None, None),
             DType::F32 => self.fwd::<f32>(x, x_l, None, None),
-            dt => candle::bail!("fused-layer-norm is only supported for f32, f16 and bf16 ({dt:?})"),
+            dt => {
+                candle::bail!("fused-layer-norm is only supported for f32, f16 and bf16 ({dt:?})")
+            }
         }
     }
 }
@@ -246,7 +241,9 @@ impl candle::CustomOp2 for LayerNorm {
             DType::F16 => self.fwd::<f16>(x, x_l, Some(r), Some(r_l)),
             DType::BF16 => self.fwd::<bf16>(x, x_l, Some(r), Some(r_l)),
             DType::F32 => self.fwd::<f32>(x, x_l, Some(r), Some(r_l)),
-            dt => candle::bail!("fused-layer-norm is only supported for f32, f16 and bf16 ({dt:?})"),
+            dt => {
+                candle::bail!("fused-layer-norm is only supported for f32, f16 and bf16 ({dt:?})")
+            }
         }
     }
 }
@@ -261,12 +258,7 @@ impl candle::CustomOp2 for LayerNorm {
 /// * `epsilon` - A value added to the denominator for numerical stability
 ///
 /// The resulting tensor has the same dimensions as `x`
-pub fn layer_norm(
-    x: &Tensor,
-    gamma: &Tensor,
-    beta: &Tensor,
-    epsilon: f32,
-) -> Result<Tensor> {
+pub fn layer_norm(x: &Tensor, gamma: &Tensor, beta: &Tensor, epsilon: f32) -> Result<Tensor> {
     let op = LayerNorm {
         epsilon,
         gamma: gamma.clone(),
@@ -275,7 +267,6 @@ pub fn layer_norm(
     };
     x.apply_op1(op)
 }
-
 
 /// Fused Add Layer Normalization Layer
 ///
@@ -315,12 +306,7 @@ pub fn fused_add_layer_norm(
 /// * `epsilon` - A value added to the denominator for numerical stability
 ///
 /// The resulting tensor has the same dimensions as `x`
-pub fn rms_norm(
-    x: &Tensor,
-    gamma: &Tensor,
-    beta: &Tensor,
-    epsilon: f32,
-) -> Result<Tensor> {
+pub fn rms_norm(x: &Tensor, gamma: &Tensor, beta: &Tensor, epsilon: f32) -> Result<Tensor> {
     let op = LayerNorm {
         epsilon,
         gamma: gamma.clone(),
@@ -360,10 +346,16 @@ pub fn fused_add_rms_norm(
 
 #[cfg(test)]
 mod tests {
-    use candle::{Device, DType};
     use super::*;
+    use candle::{DType, Device};
 
-    fn layer_norm_truth(x: &Tensor, gamma: &Tensor, beta: &Tensor, epsilon: f64, rms: bool) -> Result<Tensor> {
+    fn layer_norm_truth(
+        x: &Tensor,
+        gamma: &Tensor,
+        beta: &Tensor,
+        epsilon: f64,
+        rms: bool,
+    ) -> Result<Tensor> {
         let x_dtype = x.dtype();
         let internal_dtype = match x_dtype {
             DType::F16 | DType::BF16 => DType::F32,
