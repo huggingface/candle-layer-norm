@@ -6,22 +6,8 @@ use rayon::prelude::*;
 use std::path::PathBuf;
 use std::str::FromStr;
 
-const KERNEL_FILES: [&str; 15] = [
-    "ln_api.cu",
-    "ln_fwd_256.cu",
-    "ln_fwd_512.cu",
-    "ln_fwd_768.cu",
-    "ln_fwd_1024.cu",
-    "ln_fwd_1280.cu",
-    "ln_fwd_1536.cu",
-    "ln_fwd_2048.cu",
-    "ln_fwd_2560.cu",
-    "ln_fwd_3072.cu",
-    "ln_fwd_4096.cu",
-    "ln_fwd_5120.cu",
-    "ln_fwd_6144.cu",
-    "ln_fwd_7168.cu",
-    "ln_fwd_8192.cu",
+const KERNEL_FILES: [&str; 1] = [
+    "ln_api.cu"
 ];
 
 fn main() -> Result<()> {
@@ -88,10 +74,6 @@ fn main() -> Result<()> {
             .any(|entry| {
                 if let (Ok(entry), Ok(out_modified)) = (entry, &out_modified) {
                     let in_modified = entry.metadata().unwrap().modified().unwrap();
-                    println!(
-                        "cargo:warning= {:?} {in_modified:?} - {out_modified:?} - {entry:?}",
-                        in_modified.duration_since(*out_modified)
-                    );
                     in_modified.duration_since(*out_modified).is_ok()
                 } else {
                     true
@@ -107,20 +89,20 @@ fn main() -> Result<()> {
                 let mut command = std::process::Command::new("nvcc");
                 command
                     .arg("-std=c++17")
-                    // .arg("-O3")
-                    // .arg("-U__CUDA_NO_HALF_OPERATORS__")
-                    // .arg("-U__CUDA_NO_HALF_CONVERSIONS__")
-                    // .arg("-U__CUDA_NO_BFLOAT16_OPERATORS__")
-                    // .arg("-U__CUDA_NO_BFLOAT16_CONVERSIONS__")
-                    // .arg("-U__CUDA_NO_BFLOAT162_OPERATORS__")
-                    // .arg("-U__CUDA_NO_BFLOAT162_CONVERSIONS__")
+                    .arg("-O3")
+                    .arg("-U__CUDA_NO_HALF_OPERATORS__")
+                    .arg("-U__CUDA_NO_HALF_CONVERSIONS__")
+                    .arg("-U__CUDA_NO_BFLOAT16_OPERATORS__")
+                    .arg("-U__CUDA_NO_BFLOAT16_CONVERSIONS__")
+                    .arg("-U__CUDA_NO_BFLOAT162_OPERATORS__")
+                    .arg("-U__CUDA_NO_BFLOAT162_CONVERSIONS__")
                     .arg(format!("--gpu-architecture=sm_{compute_cap}"))
                     .arg("-c")
                     .args(["-o", obj_file.to_str().unwrap()])
                     .args(["--default-stream", "per-thread"])
                     .arg("--expt-relaxed-constexpr")
                     .arg("--expt-extended-lambda")
-                    // .arg("--use_fast_math")
+                    .arg("--use_fast_math")
                     .arg("--verbose");
                 if let Ok(ccbin_path) = &ccbin_env {
                     command

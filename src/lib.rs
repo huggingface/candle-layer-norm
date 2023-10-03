@@ -1,17 +1,28 @@
-extern crate core;
-
 mod ffi;
 
+use std::ptr;
 use candle::backend::BackendStorage;
 use candle::cuda_backend::cudarc::driver::DevicePtr;
 use candle::cuda_backend::WrapErr;
-use candle::{CpuStorage, Layout, Result, Shape, Tensor};
+use candle::{CpuStorage, DType, Layout, Result, Shape, Tensor, Storage};
 use candle::cuda_backend::cudarc::driver::sys::CUdevice_attribute::CU_DEVICE_ATTRIBUTE_MULTIPROCESSOR_COUNT;
 use half::{bf16, f16};
 
+fn layer_norm_internal_type(dtype: DType) -> Result<u32> {
+    let internal_type = match dtype {
+        DType::F16 => 0,
+        DType::BF16 => 1,
+        DType::F32 => 2,
+        dtype => candle::bail!("dtype {dtype:?} is not supported")
+    };
+    Ok(internal_type)
+}
+
 pub struct LayerNorm {
     pub epsilon: f32,
-    pub is_rms_norm: bool
+    pub is_rms_norm: bool,
+    pub gamma: Tensor,
+    pub beta: Tensor,
 }
 
 fn round_multiple(x: usize, m: usize) -> usize {
@@ -19,60 +30,70 @@ fn round_multiple(x: usize, m: usize) -> usize {
 }
 
 impl LayerNorm {
-    pub fn cuda_fwd_t<
-        T: candle::cuda_backend::CudaDType + candle::cuda_backend::cudarc::driver::DeviceRepr,
+    fn fwd<
+        T: candle::cuda_backend::CudaDType + candle::cuda_backend::cudarc::driver::DeviceRepr
     >(
         &self,
         x: &candle::CudaStorage,
         x_l: &Layout,
-        r: &candle::CudaStorage,
-        r_l: &Layout,
-        g: &candle::CudaStorage,
-        g_l: &Layout,
-        b: &candle::CudaStorage,
-        b_l: &Layout,
-    ) -> Result<(candle::CudaStorage, candle::CudaStorage, Shape)> {
+        r: Option<&candle::CudaStorage>,
+        r_l: Option<&Layout>,
+    ) -> Result<(candle::CudaStorage, Shape)> {
+        // Assume all tensors are on the same device and take device of x
         let dev = x.device();
-
+        // Out has the same shape as inp
         let out_shape = x_l.shape().clone();
 
-        let x = x.as_cuda_slice::<f16>()?;
-        let r = r.as_cuda_slice::<f16>()?;
-        let g = g.as_cuda_slice::<f16>()?;
-        let b = b.as_cuda_slice::<f16>()?;
+        // Get internal layer norm type id for the given dtype
+        let layer_norm_type = layer_norm_internal_type(x.dtype())?;
 
+        // Make sure that gamma is a CUDA tensor and get the underlying storage
+        let (g, g_l) = self.gamma.storage_and_layout();
+        let g = match &*g {
+            Storage::Cpu(_) => candle::bail!("gamma must be a cuda tensor"),
+            Storage::Cuda(g) => g
+        };
+
+        // Make sure that beta is a CUDA tensor and get the underlying storage
+        let (b, b_l) = self.beta.storage_and_layout();
+        let b = match &*b {
+            Storage::Cpu(_) => candle::bail!("gamma must be a cuda tensor"),
+            Storage::Cuda(b) => b
+        };
+
+        // Get cuda slices for all tensors
+        let x = x.as_cuda_slice::<T>()?;
+        let g = g.as_cuda_slice::<T>()?;
+        let b = b.as_cuda_slice::<T>()?;
+
+        // Get cuda views for all tensors
         let x = x.slice(x_l.start_offset()..);
-        let r = r.slice(r_l.start_offset()..);
         let g = g.slice(g_l.start_offset()..);
         let b = b.slice(b_l.start_offset()..);
 
+        // Input matrix layout
         let rows = x_l.dims()[0];
         let cols = x_l.dims()[1];
 
         if !(cols % 8 == 0 && cols <= 8192) {
-           candle::bail!("hidden size must be % 8 and <= 8192")
+            candle::bail!("hidden size must be % 8 and <= 8192")
         }
 
         let x_stride = x_l.stride();
-        let r_stride = r_l.stride();
         let g_stride = g_l.stride();
         let b_stride = b_l.stride();
 
         let x_rank = x_stride.len();
-        let r_rank = r_stride.len();
         let g_rank = g_stride.len();
         let b_rank = b_stride.len();
 
-        if x_rank != 2 || r_rank != 2  {
+        if x_rank != 2 {
             candle::bail!(
-                "layer-norm expects input tensors of rank r (x: {x_rank}, r: {r_rank}"
+                "layer-norm expects input tensors of rank 2. Found: {x_rank}"
             )
         }
         if x_stride[x_rank - 1] != 1 {
             candle::bail!("the last dim of x must be contiguous {x_stride:?}")
-        }
-        if r_stride[r_rank - 1] != 1 {
-            candle::bail!("the last dim of r must be contiguous {r_stride:?}")
         }
         if g_stride[g_rank - 1] != 1 {
             candle::bail!("the last dim of g must be contiguous {g_stride:?}")
@@ -81,6 +102,7 @@ impl LayerNorm {
             candle::bail!("the last dim of b must be contiguous {b_stride:?}")
         }
 
+        // Round cols to match with the correct kernel
         let cols_rounded = if cols <= 1536 {
             round_multiple(cols, 256)
         } else if cols <= 3072 {
@@ -89,28 +111,59 @@ impl LayerNorm {
             round_multiple(cols, 1024)
         };
 
+        // Alloc internal buffers
         let mu = unsafe { dev.alloc::<f32>(rows) }.w()?;
         let rsigma = unsafe { dev.alloc::<f32>(rows) }.w()?;
 
+        // Alloc result buffers
         let elem_count = out_shape.elem_count();
-        let dst = unsafe { dev.alloc::<f16>(elem_count) }.w()?;
-        let dst_add = unsafe { dev.alloc::<f16>(elem_count) }.w()?;
+        let dst = unsafe { dev.alloc::<T>(elem_count) }.w()?;
+        let dst_add = unsafe { dev.alloc::<T>(elem_count) }.w()?;
 
         let is_rms_norm = if self.is_rms_norm { 1 } else { 0 };
 
+        // If residual is set, get its device pointer
+        let r_ptr = if let (Some(r), Some(r_l)) = (r, r_l) {
+            // Check shape
+            let expected_shape = x_l.shape().dims2()?;
+            if r_l.shape().dims2()? != expected_shape {
+                candle::bail!("shape mismatch x {:?} and r {:?}", x_l.shape(), r_l.shape());
+            }
+
+            let r = r.as_cuda_slice::<T>()?;
+            let r = r.slice(r_l.start_offset()..);
+
+            let r_stride = r_l.stride();
+            let r_rank = r_stride.len();
+
+            if r_rank != 2 {
+                candle::bail!(
+                "layer-norm expects input tensors of rank 2. Found: {r_rank}"
+            )
+            }
+
+            if r_stride[r_rank - 1] != 1 {
+                candle::bail!("the last dim of r must be contiguous {r_stride:?}")
+            }
+            *r.device_ptr() as *const std::ffi::c_void
+        } else {
+            ptr::null() as *const std::ffi::c_void
+        };
+
+
+        // Get cuda device pointers from cuda slices
+        let x_ptr = *x.device_ptr() as *const core::ffi::c_void;
+        let g_ptr = *g.device_ptr() as *const core::ffi::c_void;
+        let b_ptr = *b.device_ptr() as *const core::ffi::c_void;
+        let dst_add_ptr = *dst_add.device_ptr() as *const core::ffi::c_void;
+        let dst_ptr = *dst.device_ptr() as *const core::ffi::c_void;
+        let mu_ptr = *mu.device_ptr() as *const core::ffi::c_void;
+        let rsigma_ptr = *rsigma.device_ptr() as *const core::ffi::c_void;
+
+        let multi_processors_count = dev.attribute(CU_DEVICE_ATTRIBUTE_MULTIPROCESSOR_COUNT).unwrap();
 
         unsafe {
-            let x_ptr = *x.device_ptr() as *const core::ffi::c_void;
-            let r_ptr = *r.device_ptr() as *const core::ffi::c_void;
-            let g_ptr = *g.device_ptr() as *const core::ffi::c_void;
-            let b_ptr = *b.device_ptr() as *const core::ffi::c_void;
-            let dst_add_ptr = *dst_add.device_ptr() as *const core::ffi::c_void;
-            let dst_ptr = *dst.device_ptr() as *const core::ffi::c_void;
-            let mu_ptr = *mu.device_ptr() as *const core::ffi::c_void;
-            let rsigma_ptr = *rsigma.device_ptr() as *const core::ffi::c_void;
-
-            let multi_processors_count = dev.attribute(CU_DEVICE_ATTRIBUTE_MULTIPROCESSOR_COUNT).unwrap();
-
+            // Launch Kernel
             ffi::run_ln(
                 x_ptr,
                 r_ptr,
@@ -120,149 +173,289 @@ impl LayerNorm {
                 dst_ptr,
                 mu_ptr,
                 rsigma_ptr,
-
                 self.epsilon,
-
-                // cols_rounded as u32,
-                256 as u32,
+                cols_rounded as u32,
                 rows as u32,
                 cols as u32,
                 multi_processors_count,
-
+                layer_norm_type,
+                layer_norm_type,
+                layer_norm_type,
+                layer_norm_type,
                 2,
-                2,
-                2,
-                2,
-                2,
-
                 is_rms_norm,
             )
         }
 
         let dst = candle::CudaStorage::wrap_cuda_slice(dst, dev.clone());
-        let dst_add = candle::CudaStorage::wrap_cuda_slice(dst_add, dev.clone());
 
-        Ok((dst, dst_add, out_shape))
+        Ok((dst, out_shape))
     }
 }
 
-// impl candle::CustomOp3 for LayerNorm {
-//     fn name(&self) -> &'static str {
-//         "flash-attn-varlen"
-//     }
-//
-//     fn cpu_fwd(
-//         &self,
-//         _: &CpuStorage,
-//         _: &Layout,
-//         _: &CpuStorage,
-//         _: &Layout,
-//         _: &CpuStorage,
-//         _: &Layout,
-//     ) -> Result<(CpuStorage, Shape)> {
-//         candle::bail!("no cpu support for flash-attn")
-//     }
-//
-//     fn cuda_fwd(
-//         &self,
-//         q: &candle::CudaStorage,
-//         q_l: &Layout,
-//         k: &candle::CudaStorage,
-//         k_l: &Layout,
-//         v: &candle::CudaStorage,
-//         v_l: &Layout,
-//     ) -> Result<(candle::CudaStorage, Shape)> {
-//         match q.dtype() {
-//             candle::DType::F16 => self.cuda_fwd_t::<f16>(q, q_l, k, k_l, v, v_l, false),
-//             candle::DType::BF16 => self.cuda_fwd_t::<bf16>(q, q_l, k, k_l, v, v_l, true),
-//             dt => candle::bail!("flash-attn is only supported for f16/bf16 ({dt:?})"),
-//         }
-//     }
-// }
-//
-// #[allow(clippy::too_many_arguments)]
-// /// Flash-attention v2 layer with variable-length batching.
-// ///
-// /// This implements scaled dot-product attention, `softmax(Q @ K^T . softmax_scale) @ V`.
-// /// Multi-query and grouped-query attention are supported by using tensors k and v with fewer heads
-// /// than q, the number of heads in k and v has to be divisible by the number of heads in q.
-// ///
-// /// # Arguments
-// ///
-// /// * `q` - Query tensor with shape `(total_q, num_heads_q, head_size)`.
-// /// * `k` - Key tensor with shape `(total_kv, num_heads_kv, head_size)`.
-// /// * `v` - Value tensor with shape `(total_kv, num_heads_kv, head_size)`.
-// /// * `seqlens_q` - The cumulative lengths of the sequences in the batch, used to index in q.
-// /// * `seqlens_k` - The cumulative lengths of the sequences in the batch, used to index in k and v.
-// /// * `max_seqlen_q` - The maximum query sequence length for q in the batch.
-// /// * `max_seqlen_k` - The maximum query sequence length for k and v in the batch.
-// ///
-// /// `seqlens_q` and `seqlens_k` contain `batch_size + 1` elements, typically `0`, `seqlen_1`,
-// /// `seqlen_1 + seqlen_2`, etc.
-// ///
-// /// The resulting tensor has dimensions `(total_q, num_heads_q, head_size)`.
-// pub fn flash_attn_varlen(
-//     q: &Tensor,
-//     k: &Tensor,
-//     v: &Tensor,
-//     seqlens_q: &Tensor,
-//     seqlens_k: &Tensor,
-//     max_seqlen_q: usize,
-//     max_seqlen_k: usize,
-//     softmax_scale: f32,
-//     causal: bool,
-// ) -> Result<Tensor> {
-//     let op = LayerNorm {
-//         softmax_scale,
-//         causal,
-//         max_seqlen_q,
-//         max_seqlen_k,
-//         seqlens_q: seqlens_q.clone(),
-//         seqlens_k: seqlens_k.clone(),
-//     };
-//     q.apply_op3(k, v, op)
-// }
+impl candle::CustomOp1 for LayerNorm {
+    fn name(&self) -> &'static str {
+        "fused-layer-norm"
+    }
+
+    fn cpu_fwd(
+        &self,
+        _: &CpuStorage,
+        _: &Layout,
+    ) -> Result<(CpuStorage, Shape)> {
+        candle::bail!("no cpu support for fused-layer-norm")
+    }
+
+    fn cuda_fwd(
+        &self,
+        x: &candle::CudaStorage,
+        x_l: &Layout,
+    ) -> Result<(candle::CudaStorage, Shape)> {
+        match x.dtype() {
+            DType::F16 => self.fwd::<f16>(x, x_l, None, None),
+            DType::BF16 => self.fwd::<bf16>(x, x_l, None, None),
+            DType::F32 => self.fwd::<f32>(x, x_l, None, None),
+            dt => candle::bail!("fused-layer-norm is only supported for f32, f16 and bf16 ({dt:?})"),
+        }
+    }
+}
+
+impl candle::CustomOp2 for LayerNorm {
+    fn name(&self) -> &'static str {
+        "fused-layer-norm"
+    }
+
+    fn cpu_fwd(
+        &self,
+        _: &CpuStorage,
+        _: &Layout,
+        _: &CpuStorage,
+        _: &Layout,
+    ) -> Result<(CpuStorage, Shape)> {
+        candle::bail!("no cpu support for fused-layer-norm")
+    }
+
+    fn cuda_fwd(
+        &self,
+        x: &candle::CudaStorage,
+        x_l: &Layout,
+        r: &candle::CudaStorage,
+        r_l: &Layout,
+    ) -> Result<(candle::CudaStorage, Shape)> {
+        match x.dtype() {
+            DType::F16 => self.fwd::<f16>(x, x_l, Some(r), Some(r_l)),
+            DType::BF16 => self.fwd::<bf16>(x, x_l, Some(r), Some(r_l)),
+            DType::F32 => self.fwd::<f32>(x, x_l, Some(r), Some(r_l)),
+            dt => candle::bail!("fused-layer-norm is only supported for f32, f16 and bf16 ({dt:?})"),
+        }
+    }
+}
+
+/// Layer Normalization Layer
+///
+/// # Arguments
+///
+/// * `x` - Input tensor of rank 2
+/// * `gamma` - Channel scale
+/// * `beta` - Channel bias
+/// * `epsilon` - A value added to the denominator for numerical stability
+///
+/// The resulting tensor has the same dimensions as `x`
+pub fn layer_norm(
+    x: &Tensor,
+    gamma: &Tensor,
+    beta: &Tensor,
+    epsilon: f32,
+) -> Result<Tensor> {
+    let op = LayerNorm {
+        epsilon,
+        gamma: gamma.clone(),
+        beta: beta.clone(),
+        is_rms_norm: false,
+    };
+    x.apply_op1(op)
+}
+
+
+/// Fused Add Layer Normalization Layer
+///
+/// # Arguments
+///
+/// * `x` - Input tensor of rank 2
+/// * `res` - Residual tensor of rank 2. Will be added to `x` before normalization. Must have
+/// the same shape as `x`.
+/// * `gamma` - Channel scale
+/// * `beta` - Channel bias
+/// * `epsilon` - A value added to the denominator for numerical stability
+///
+/// The resulting tensor has the same dimensions as `x`
+pub fn fused_add_layer_norm(
+    x: &Tensor,
+    res: &Tensor,
+    gamma: &Tensor,
+    beta: &Tensor,
+    epsilon: f32,
+) -> Result<Tensor> {
+    let op = LayerNorm {
+        epsilon,
+        gamma: gamma.clone(),
+        beta: beta.clone(),
+        is_rms_norm: false,
+    };
+    x.apply_op2(&res, op)
+}
+
+/// Layer RMS Normalization Layer
+///
+/// # Arguments
+///
+/// * `x` - Input tensor of rank 2
+/// * `gamma` - Channel scale
+/// * `beta` - Channel bias
+/// * `epsilon` - A value added to the denominator for numerical stability
+///
+/// The resulting tensor has the same dimensions as `x`
+pub fn rms_norm(
+    x: &Tensor,
+    gamma: &Tensor,
+    beta: &Tensor,
+    epsilon: f32,
+) -> Result<Tensor> {
+    let op = LayerNorm {
+        epsilon,
+        gamma: gamma.clone(),
+        beta: beta.clone(),
+        is_rms_norm: true,
+    };
+    x.apply_op1(op)
+}
+
+/// Fused Add RMS Normalization Layer
+///
+/// # Arguments
+///
+/// * `x` - Input tensor of rank 2
+/// * `res` - Residual tensor of rank 2. Will be added to `x` before normalization. Must have
+/// the same shape as `x`.
+/// * `gamma` - Channel scale
+/// * `beta` - Channel bias
+/// * `epsilon` - A value added to the denominator for numerical stability
+///
+/// The resulting tensor has the same dimensions as `x`
+pub fn fused_add_rms_norm(
+    x: &Tensor,
+    res: &Tensor,
+    gamma: &Tensor,
+    beta: &Tensor,
+    epsilon: f32,
+) -> Result<Tensor> {
+    let op = LayerNorm {
+        epsilon,
+        gamma: gamma.clone(),
+        beta: beta.clone(),
+        is_rms_norm: true,
+    };
+    x.apply_op2(&res, op)
+}
 
 #[cfg(test)]
 mod tests {
-    use candle::{Device, DType, Storage};
+    use candle::{Device, DType};
     use super::*;
 
+    fn layer_norm_truth(x: &Tensor, gamma: &Tensor, beta: &Tensor, epsilon: f64, rms: bool) -> Result<Tensor> {
+        let x_dtype = x.dtype();
+        let internal_dtype = match x_dtype {
+            DType::F16 | DType::BF16 => DType::F32,
+            d => d,
+        };
+
+        let (_seq_len, hidden_size) = x.shape().dims2()?;
+        let x = x.to_dtype(internal_dtype)?;
+
+        let x = if !rms {
+            let mean_x = (x.sum_keepdim(1)? / hidden_size as f64)?;
+            x.broadcast_sub(&mean_x)?
+        } else {
+            x
+        };
+
+        let norm_x = (x.sqr()?.sum_keepdim(1)? / hidden_size as f64)?;
+        let x_normed = x.broadcast_div(&(norm_x + epsilon)?.sqrt()?)?;
+
+        let x = x_normed
+            .to_dtype(x_dtype)?
+            .broadcast_mul(gamma)?
+            .broadcast_add(beta)?;
+        Ok(x)
+    }
+
+    fn to_vec2_round(t: Tensor, digits: i32) -> Result<Vec<Vec<f32>>> {
+        let b = 10f32.powi(digits);
+        let t = t.to_dtype(DType::F32)?.to_vec2::<f32>()?;
+        let t = t
+            .iter()
+            .map(|t| t.iter().map(|t| f32::round(t * b) / b).collect())
+            .collect();
+        Ok(t)
+    }
+
     #[test]
-    fn test_layer_norm () -> Result<()> {
+    fn test_layer_norm() -> Result<()> {
         let device = Device::new_cuda(0)?;
 
-        let x = Tensor::randn(0., 1., (4, 256), &device)?.to_dtype(DType::F16)?;
-        let (x, x_l) = x.storage_and_layout();
-        let r = Tensor::randn(0., 1., (4, 256), &device)?.to_dtype(DType::F16)?;
-        let (r, r_l) = r.storage_and_layout();
+        let x = Tensor::randn(0., 1., (4, 8), &device)?.to_dtype(DType::F32)?;
+        let g = Tensor::randn(0., 1., 8, &device)?.to_dtype(DType::F32)?;
+        let b = Tensor::randn(0., 1., 8, &device)?.to_dtype(DType::F32)?;
 
-        let g = Tensor::randn(0., 1., 256, &device)?.to_dtype(DType::F16)?;
-        let (g, g_l) = g.storage_and_layout();
-        let b = Tensor::randn(0., 1., 256, &device)?.to_dtype(DType::F16)?;
-        let (b, b_l) = b.storage_and_layout();
+        let res = layer_norm(&x, &g, &b, 1e-12)?;
+        let truth = layer_norm_truth(&x, &g, &b, 1e-12, false)?;
 
-        let x = match &*x {
-            Storage::Cpu(_) => candle::bail!("x must be a cuda tensor"),
-            Storage::Cuda(x) => x
-        };
-        let r = match &*r {
-            Storage::Cpu(_) => candle::bail!("r must be a cuda tensor"),
-            Storage::Cuda(r) => r
-        };
-        let g = match &*g {
-            Storage::Cpu(_) => candle::bail!("g must be a cuda tensor"),
-            Storage::Cuda(g) => g
-        };
-        let b = match &*b {
-            Storage::Cpu(_) => candle::bail!("b must be a cuda tensor"),
-            Storage::Cuda(b) => b
-        };
-
-
-        let ln = LayerNorm { epsilon: 1e-12, is_rms_norm: false };
-        let (r, add_r, s) = ln.cuda_fwd_t::<f16>(x, x_l, r, r_l, g, g_l, b, b_l)?;
+        assert_eq!(to_vec2_round(res, 3)?, to_vec2_round(truth, 3)?);
         Ok(())
     }
 
+    #[test]
+    fn test_rms_norm() -> Result<()> {
+        let device = Device::new_cuda(0)?;
+
+        let x = Tensor::randn(0., 1., (4, 8), &device)?.to_dtype(DType::F32)?;
+        let g = Tensor::randn(0., 1., 8, &device)?.to_dtype(DType::F32)?;
+        let b = Tensor::randn(0., 1., 8, &device)?.to_dtype(DType::F32)?;
+
+        let res = rms_norm(&x, &g, &b, 1e-12)?;
+        let truth = layer_norm_truth(&x, &g, &b, 1e-12, true)?;
+        assert_eq!(to_vec2_round(res, 3)?, to_vec2_round(truth, 3)?);
+        Ok(())
+    }
+
+    #[test]
+    fn test_layer_norm_add() -> Result<()> {
+        let device = Device::new_cuda(0)?;
+
+        let x = Tensor::randn(0., 1., (4, 8), &device)?.to_dtype(DType::F32)?;
+        let r = Tensor::randn(0., 1., (4, 8), &device)?.to_dtype(DType::F32)?;
+        let g = Tensor::randn(0., 1., 8, &device)?.to_dtype(DType::F32)?;
+        let b = Tensor::randn(0., 1., 8, &device)?.to_dtype(DType::F32)?;
+
+        let res = fused_add_layer_norm(&x, &r, &g, &b, 1e-12)?;
+        let truth = layer_norm_truth(&(x + r)?, &g, &b, 1e-12, false)?;
+        assert_eq!(to_vec2_round(res, 3)?, to_vec2_round(truth, 3)?);
+        Ok(())
+    }
+
+    #[test]
+    fn test_rms_norm_add() -> Result<()> {
+        let device = Device::new_cuda(0)?;
+
+        let x = Tensor::randn(0., 1., (4, 8), &device)?.to_dtype(DType::F32)?;
+        let r = Tensor::randn(0., 1., (4, 8), &device)?.to_dtype(DType::F32)?;
+        let g = Tensor::randn(0., 1., 8, &device)?.to_dtype(DType::F32)?;
+        let b = Tensor::randn(0., 1., 8, &device)?.to_dtype(DType::F32)?;
+
+        let res = fused_add_rms_norm(&x, &r, &g, &b, 1e-12)?;
+        let truth = layer_norm_truth(&(x + r)?, &g, &b, 1e-12, true)?;
+        assert_eq!(to_vec2_round(res, 3)?, to_vec2_round(truth, 3)?);
+        Ok(())
+    }
 }
