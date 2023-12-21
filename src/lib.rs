@@ -22,7 +22,7 @@ pub struct LayerNorm {
     pub epsilon: f32,
     pub is_rms_norm: bool,
     pub gamma: Tensor,
-    pub beta: Tensor,
+    pub beta: Option<Tensor>,
 }
 
 fn round_multiple(x: usize, m: usize) -> usize {
@@ -54,22 +54,13 @@ impl LayerNorm {
             Storage::Cuda(g) => g,
         };
 
-        // Make sure that beta is a CUDA tensor and get the underlying storage
-        let (b, b_l) = self.beta.storage_and_layout();
-        let b = match &*b {
-            Storage::Cpu(_) => candle::bail!("gamma must be a cuda tensor"),
-            Storage::Cuda(b) => b,
-        };
-
         // Get cuda slices for all tensors
         let x = x.as_cuda_slice::<T>()?;
         let g = g.as_cuda_slice::<T>()?;
-        let b = b.as_cuda_slice::<T>()?;
 
         // Get cuda views for all tensors
         let x = x.slice(x_l.start_offset()..);
         let g = g.slice(g_l.start_offset()..);
-        let b = b.slice(b_l.start_offset()..);
 
         // Input matrix layout
         let rows = x_l.dims()[0];
@@ -81,11 +72,9 @@ impl LayerNorm {
 
         let x_stride = x_l.stride();
         let g_stride = g_l.stride();
-        let b_stride = b_l.stride();
 
         let x_rank = x_stride.len();
         let g_rank = g_stride.len();
-        let b_rank = b_stride.len();
 
         if x_rank != 2 {
             candle::bail!("layer-norm expects input tensors of rank 2. Found: {x_rank}")
@@ -95,9 +84,6 @@ impl LayerNorm {
         }
         if g_stride[g_rank - 1] != 1 {
             candle::bail!("the last dim of g must be contiguous {g_stride:?}")
-        }
-        if b_stride[b_rank - 1] != 1 {
-            candle::bail!("the last dim of b must be contiguous {b_stride:?}")
         }
 
         // Round cols to match with the correct kernel
@@ -119,6 +105,29 @@ impl LayerNorm {
         let dst_add = unsafe { dev.alloc::<T>(elem_count) }.w()?;
 
         let is_rms_norm = if self.is_rms_norm { 1 } else { 0 };
+
+        // If beta is et, get ids device pointer
+        let b_ptr = if let Some(beta) = &self.beta {
+            // Make sure that beta is a CUDA tensor and get the underlying storage
+            let (b, b_l) = beta.storage_and_layout();
+            let b = match &*b {
+                Storage::Cpu(_) => candle::bail!("gamma must be a cuda tensor"),
+                Storage::Cuda(b) => b,
+            };
+
+            let b = b.as_cuda_slice::<T>()?;
+            let b = b.slice(b_l.start_offset()..);
+
+            let b_stride = b_l.stride();
+            let b_rank = b_stride.len();
+
+            if b_stride[b_rank - 1] != 1 {
+                candle::bail!("the last dim of b must be contiguous {b_stride:?}")
+            }
+            *b.device_ptr() as *const core::ffi::c_void
+        } else {
+            ptr::null() as *const std::ffi::c_void
+        };
 
         // If residual is set, get its device pointer
         let r_ptr = if let (Some(r), Some(r_l)) = (r, r_l) {
@@ -149,7 +158,6 @@ impl LayerNorm {
         // Get cuda device pointers from cuda slices
         let x_ptr = *x.device_ptr() as *const core::ffi::c_void;
         let g_ptr = *g.device_ptr() as *const core::ffi::c_void;
-        let b_ptr = *b.device_ptr() as *const core::ffi::c_void;
         let dst_add_ptr = *dst_add.device_ptr() as *const core::ffi::c_void;
         let dst_ptr = *dst.device_ptr() as *const core::ffi::c_void;
         let mu_ptr = *mu.device_ptr() as *const core::ffi::c_void;
@@ -258,11 +266,16 @@ impl candle::CustomOp2 for LayerNorm {
 /// * `epsilon` - A value added to the denominator for numerical stability
 ///
 /// The resulting tensor has the same dimensions as `x`
-pub fn layer_norm(x: &Tensor, gamma: &Tensor, beta: &Tensor, epsilon: f32) -> Result<Tensor> {
+pub fn layer_norm(
+    x: &Tensor,
+    gamma: &Tensor,
+    beta: Option<&Tensor>,
+    epsilon: f32,
+) -> Result<Tensor> {
     let op = LayerNorm {
         epsilon,
         gamma: gamma.clone(),
-        beta: beta.clone(),
+        beta: beta.cloned(),
         is_rms_norm: false,
     };
     x.apply_op1(op)
@@ -284,13 +297,13 @@ pub fn fused_add_layer_norm(
     x: &Tensor,
     res: &Tensor,
     gamma: &Tensor,
-    beta: &Tensor,
+    beta: Option<&Tensor>,
     epsilon: f32,
 ) -> Result<Tensor> {
     let op = LayerNorm {
         epsilon,
         gamma: gamma.clone(),
-        beta: beta.clone(),
+        beta: beta.cloned(),
         is_rms_norm: false,
     };
     x.apply_op2(&res, op)
@@ -306,11 +319,11 @@ pub fn fused_add_layer_norm(
 /// * `epsilon` - A value added to the denominator for numerical stability
 ///
 /// The resulting tensor has the same dimensions as `x`
-pub fn rms_norm(x: &Tensor, gamma: &Tensor, beta: &Tensor, epsilon: f32) -> Result<Tensor> {
+pub fn rms_norm(x: &Tensor, gamma: &Tensor, beta: Option<&Tensor>, epsilon: f32) -> Result<Tensor> {
     let op = LayerNorm {
         epsilon,
         gamma: gamma.clone(),
-        beta: beta.clone(),
+        beta: beta.cloned(),
         is_rms_norm: true,
     };
     x.apply_op1(op)
@@ -332,13 +345,13 @@ pub fn fused_add_rms_norm(
     x: &Tensor,
     res: &Tensor,
     gamma: &Tensor,
-    beta: &Tensor,
+    beta: Option<&Tensor>,
     epsilon: f32,
 ) -> Result<Tensor> {
     let op = LayerNorm {
         epsilon,
         gamma: gamma.clone(),
-        beta: beta.clone(),
+        beta: beta.cloned(),
         is_rms_norm: true,
     };
     x.apply_op2(&res, op)
@@ -352,7 +365,7 @@ mod tests {
     fn layer_norm_truth(
         x: &Tensor,
         gamma: &Tensor,
-        beta: &Tensor,
+        beta: Option<&Tensor>,
         epsilon: f64,
         rms: bool,
     ) -> Result<Tensor> {
@@ -375,10 +388,10 @@ mod tests {
         let norm_x = (x.sqr()?.sum_keepdim(1)? / hidden_size as f64)?;
         let x_normed = x.broadcast_div(&(norm_x + epsilon)?.sqrt()?)?;
 
-        let x = x_normed
-            .to_dtype(x_dtype)?
-            .broadcast_mul(gamma)?
-            .broadcast_add(beta)?;
+        let mut x = x_normed.to_dtype(x_dtype)?.broadcast_mul(gamma)?;
+        if let Some(beta) = beta {
+            x = x.broadcast_add(beta)?;
+        }
         Ok(x)
     }
 
@@ -400,8 +413,22 @@ mod tests {
         let g = Tensor::randn(0., 1., 8, &device)?.to_dtype(DType::F32)?;
         let b = Tensor::randn(0., 1., 8, &device)?.to_dtype(DType::F32)?;
 
-        let res = layer_norm(&x, &g, &b, 1e-12)?;
-        let truth = layer_norm_truth(&x, &g, &b, 1e-12, false)?;
+        let res = layer_norm(&x, &g, Some(&b), 1e-12)?;
+        let truth = layer_norm_truth(&x, &g, Some(&b), 1e-12, false)?;
+
+        assert_eq!(to_vec2_round(res, 3)?, to_vec2_round(truth, 3)?);
+        Ok(())
+    }
+
+    #[test]
+    fn test_layer_norm_no_bias() -> Result<()> {
+        let device = Device::new_cuda(0)?;
+
+        let x = Tensor::randn(0., 1., (4, 8), &device)?.to_dtype(DType::F32)?;
+        let g = Tensor::randn(0., 1., 8, &device)?.to_dtype(DType::F32)?;
+
+        let res = layer_norm(&x, &g, None, 1e-12)?;
+        let truth = layer_norm_truth(&x, &g, None, 1e-12, false)?;
 
         assert_eq!(to_vec2_round(res, 3)?, to_vec2_round(truth, 3)?);
         Ok(())
@@ -415,8 +442,22 @@ mod tests {
         let g = Tensor::randn(0., 1., 8, &device)?.to_dtype(DType::F32)?;
         let b = Tensor::randn(0., 1., 8, &device)?.to_dtype(DType::F32)?;
 
-        let res = rms_norm(&x, &g, &b, 1e-12)?;
-        let truth = layer_norm_truth(&x, &g, &b, 1e-12, true)?;
+        let res = rms_norm(&x, &g, Some(&b), 1e-12)?;
+        let truth = layer_norm_truth(&x, &g, Some(&b), 1e-12, true)?;
+        assert_eq!(to_vec2_round(res, 3)?, to_vec2_round(truth, 3)?);
+        Ok(())
+    }
+
+    #[test]
+    fn test_rms_norm_no_bias() -> Result<()> {
+        let device = Device::new_cuda(0)?;
+
+        let x = Tensor::randn(0., 1., (4, 8), &device)?.to_dtype(DType::F32)?;
+        let g = Tensor::randn(0., 1., 8, &device)?.to_dtype(DType::F32)?;
+
+        let res = rms_norm(&x, &g, None, 1e-12)?;
+        let truth = layer_norm_truth(&x, &g, None, 1e-12, true)?;
+
         assert_eq!(to_vec2_round(res, 3)?, to_vec2_round(truth, 3)?);
         Ok(())
     }
@@ -430,8 +471,8 @@ mod tests {
         let g = Tensor::randn(0., 1., 8, &device)?.to_dtype(DType::F32)?;
         let b = Tensor::randn(0., 1., 8, &device)?.to_dtype(DType::F32)?;
 
-        let res = fused_add_layer_norm(&x, &r, &g, &b, 1e-12)?;
-        let truth = layer_norm_truth(&(x + r)?, &g, &b, 1e-12, false)?;
+        let res = fused_add_layer_norm(&x, &r, &g, Some(&b), 1e-12)?;
+        let truth = layer_norm_truth(&(x + r)?, &g, Some(&b), 1e-12, false)?;
         assert_eq!(to_vec2_round(res, 3)?, to_vec2_round(truth, 3)?);
         Ok(())
     }
@@ -445,8 +486,8 @@ mod tests {
         let g = Tensor::randn(0., 1., 8, &device)?.to_dtype(DType::F32)?;
         let b = Tensor::randn(0., 1., 8, &device)?.to_dtype(DType::F32)?;
 
-        let res = fused_add_rms_norm(&x, &r, &g, &b, 1e-12)?;
-        let truth = layer_norm_truth(&(x + r)?, &g, &b, 1e-12, true)?;
+        let res = fused_add_rms_norm(&x, &r, &g, Some(&b), 1e-12)?;
+        let truth = layer_norm_truth(&(x + r)?, &g, Some(&b), 1e-12, true)?;
         assert_eq!(to_vec2_round(res, 3)?, to_vec2_round(truth, 3)?);
         Ok(())
     }
