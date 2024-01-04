@@ -50,8 +50,8 @@ impl LayerNorm {
         // Make sure that gamma is a CUDA tensor and get the underlying storage
         let (g, g_l) = self.gamma.storage_and_layout();
         let g = match &*g {
-            Storage::Cpu(_) => candle::bail!("gamma must be a cuda tensor"),
             Storage::Cuda(g) => g,
+            _ => candle::bail!("gamma must be a cuda tensor"),
         };
 
         // Get cuda slices for all tensors
@@ -111,8 +111,8 @@ impl LayerNorm {
             // Make sure that beta is a CUDA tensor and get the underlying storage
             let (b, b_l) = beta.storage_and_layout();
             let b = match &*b {
-                Storage::Cpu(_) => candle::bail!("gamma must be a cuda tensor"),
                 Storage::Cuda(b) => b,
+                _ => candle::bail!("gamma must be a cuda tensor"),
             };
 
             let b = b.as_cuda_slice::<T>()?;
