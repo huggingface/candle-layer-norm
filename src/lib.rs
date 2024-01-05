@@ -41,8 +41,6 @@ impl LayerNorm {
     ) -> Result<(candle::CudaStorage, Shape)> {
         // Assume all tensors are on the same device and take device of x
         let dev = x.device();
-        // Out has the same shape as inp
-        let out_shape = x_l.shape().clone();
 
         // Get internal layer norm type id for the given dtype
         let layer_norm_type = layer_norm_internal_type(x.dtype())?;
@@ -95,15 +93,6 @@ impl LayerNorm {
             round_multiple(cols, 1024)
         };
 
-        // Alloc internal buffers
-        let mu = unsafe { dev.alloc::<f32>(rows) }.w()?;
-        let rsigma = unsafe { dev.alloc::<f32>(rows) }.w()?;
-
-        // Alloc result buffers
-        let elem_count = out_shape.elem_count();
-        let dst = unsafe { dev.alloc::<T>(elem_count) }.w()?;
-        let dst_add = unsafe { dev.alloc::<T>(elem_count) }.w()?;
-
         let is_rms_norm = if self.is_rms_norm { 1 } else { 0 };
 
         // If beta is et, get ids device pointer
@@ -155,6 +144,18 @@ impl LayerNorm {
             ptr::null() as *const std::ffi::c_void
         };
 
+        // We will store the results of the residual add next to the main results
+        // so out has the same shape as inp * 2
+        let out_shape = Shape::from((rows * 2, cols));
+
+        let out = unsafe { dev.alloc::<T>(out_shape.elem_count()) }.w()?;
+        let dst = out.slice(..rows * cols);
+        let dst_add = out.slice(rows * cols..);
+
+        // Alloc internal buffers
+        let mu = unsafe { dev.alloc::<f32>(rows) }.w()?;
+        let rsigma = unsafe { dev.alloc::<f32>(rows) }.w()?;
+
         // Get cuda device pointers from cuda slices
         let x_ptr = *x.device_ptr() as *const core::ffi::c_void;
         let g_ptr = *g.device_ptr() as *const core::ffi::c_void;
@@ -192,9 +193,9 @@ impl LayerNorm {
             )
         }
 
-        let dst = candle::CudaStorage::wrap_cuda_slice(dst, dev.clone());
+        let out = candle::CudaStorage::wrap_cuda_slice(out, dev.clone());
 
-        Ok((dst, out_shape))
+        Ok((out, out_shape))
     }
 }
 
@@ -278,7 +279,9 @@ pub fn layer_norm(
         beta: beta.cloned(),
         is_rms_norm: false,
     };
-    x.apply_op1(op)
+    let results = x.apply_op1(op)?;
+    let rows = x.dims()[0];
+    results.narrow(0, 0, rows)
 }
 
 /// Fused Add Layer Normalization Layer
@@ -292,21 +295,24 @@ pub fn layer_norm(
 /// * `beta` - Channel bias
 /// * `epsilon` - A value added to the denominator for numerical stability
 ///
-/// The resulting tensor has the same dimensions as `x`
+/// The resulting tensors have the same dimensions as `x`
+/// First tensor is the result of the normalization, second is the result of the residual add
 pub fn fused_add_layer_norm(
     x: &Tensor,
     res: &Tensor,
     gamma: &Tensor,
     beta: Option<&Tensor>,
     epsilon: f32,
-) -> Result<Tensor> {
+) -> Result<(Tensor, Tensor)> {
     let op = LayerNorm {
         epsilon,
         gamma: gamma.clone(),
         beta: beta.cloned(),
         is_rms_norm: false,
     };
-    x.apply_op2(&res, op)
+    let results = x.apply_op2(&res, op)?;
+    let rows = x.dims()[0];
+    Ok((results.narrow(0, 0, rows)?, results.narrow(0, rows, rows)?))
 }
 
 /// Layer RMS Normalization Layer
@@ -326,7 +332,9 @@ pub fn rms_norm(x: &Tensor, gamma: &Tensor, beta: Option<&Tensor>, epsilon: f32)
         beta: beta.cloned(),
         is_rms_norm: true,
     };
-    x.apply_op1(op)
+    let results = x.apply_op1(op)?;
+    let rows = x.dims()[0];
+    results.narrow(0, 0, rows)
 }
 
 /// Fused Add RMS Normalization Layer
@@ -340,21 +348,24 @@ pub fn rms_norm(x: &Tensor, gamma: &Tensor, beta: Option<&Tensor>, epsilon: f32)
 /// * `beta` - Channel bias
 /// * `epsilon` - A value added to the denominator for numerical stability
 ///
-/// The resulting tensor has the same dimensions as `x`
+/// The resulting tensors have the same dimensions as `x`
+/// First tensor is the result of the normalization, second is the result of the residual add
 pub fn fused_add_rms_norm(
     x: &Tensor,
     res: &Tensor,
     gamma: &Tensor,
     beta: Option<&Tensor>,
     epsilon: f32,
-) -> Result<Tensor> {
+) -> Result<(Tensor, Tensor)> {
     let op = LayerNorm {
         epsilon,
         gamma: gamma.clone(),
         beta: beta.cloned(),
         is_rms_norm: true,
     };
-    x.apply_op2(&res, op)
+    let results = x.apply_op2(&res, op)?;
+    let rows = x.dims()[0];
+    Ok((results.narrow(0, 0, rows)?, results.narrow(0, rows, rows)?))
 }
 
 #[cfg(test)]
@@ -471,8 +482,10 @@ mod tests {
         let g = Tensor::randn(0., 1., 8, &device)?.to_dtype(DType::F32)?;
         let b = Tensor::randn(0., 1., 8, &device)?.to_dtype(DType::F32)?;
 
-        let res = fused_add_layer_norm(&x, &r, &g, Some(&b), 1e-12)?;
-        let truth = layer_norm_truth(&(x + r)?, &g, Some(&b), 1e-12, false)?;
+        let (res, res_add) = fused_add_layer_norm(&x, &r, &g, Some(&b), 1e-12)?;
+        let truth_add = (x + r)?;
+        let truth = layer_norm_truth(&truth_add, &g, Some(&b), 1e-12, false)?;
+        assert_eq!(to_vec2_round(res_add, 3)?, to_vec2_round(truth_add, 3)?);
         assert_eq!(to_vec2_round(res, 3)?, to_vec2_round(truth, 3)?);
         Ok(())
     }
@@ -486,8 +499,10 @@ mod tests {
         let g = Tensor::randn(0., 1., 8, &device)?.to_dtype(DType::F32)?;
         let b = Tensor::randn(0., 1., 8, &device)?.to_dtype(DType::F32)?;
 
-        let res = fused_add_rms_norm(&x, &r, &g, Some(&b), 1e-12)?;
-        let truth = layer_norm_truth(&(x + r)?, &g, Some(&b), 1e-12, true)?;
+        let (res, res_add) = fused_add_rms_norm(&x, &r, &g, Some(&b), 1e-12)?;
+        let truth_add = (x + r)?;
+        let truth = layer_norm_truth(&truth_add, &g, Some(&b), 1e-12, true)?;
+        assert_eq!(to_vec2_round(res_add, 3)?, to_vec2_round(truth_add, 3)?);
         assert_eq!(to_vec2_round(res, 3)?, to_vec2_round(truth, 3)?);
         Ok(())
     }
