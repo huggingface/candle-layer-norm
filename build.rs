@@ -95,6 +95,8 @@ fn main() -> Result<()> {
                     .arg("-U__CUDA_NO_BFLOAT162_CONVERSIONS__")
                     .arg(format!("--gpu-architecture=sm_{compute_cap}"))
                     .arg("-c")
+                    .arg("--compiler-options")
+                    .arg("-fPIC")
                     .args(["-o", obj_file.to_str().unwrap()])
                     .args(["--default-stream", "per-thread"])
                     .arg("--expt-relaxed-constexpr")
